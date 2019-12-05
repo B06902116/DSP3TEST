@@ -1,45 +1,65 @@
-#include <stdlib.h>
 #include <iostream>
 #include <queue>
 #include "File.h"
 #include "Prob.h"
 #include "Ngram.h"
-#include "LM.h"
-#include "Vocab.h"
-#include "VocabMap.h"
+#include <vector>
+#include <map>
+#include <string>
+#include <string.h>
+#include <iterator>
 using namespace std;
+
+#define LOG_ZERO -1024
+#define MAXPERLINE 16384
+#define MAXBUFNUM  256
 #define CAND_NUM 1024
-#define LOG_ZERO -128
-#define MAXPERLINE 256
 #define MAXPRON 20
+
 typedef unsigned int unt;
 typedef pair<int, LogP> pip;
-Vocab voc, Zhuyin, Big5; 
-Ngram *lm;
-VocabMap *map;
+typedef map<string, vector<string> > MAP;
+typedef struct{
+	int index;
+	LogP p;
+	string word;
+}Node;
 
+Vocab voc; 
+Ngram *lm;
 int pron;
 
 const VocabIndex NoHistory[] = {Vocab_None};
 VocabIndex OneHistory[2];
 VocabIndex TwoHistory[3];
-void init_disambig(const char* mapping_file, const char* lm_file, int order){
+
+void init_disambig(const char* mapping_file, const char* lm_file, int order,MAP& mymap){
 	
-	//init map
-	map = new VocabMap(Zhuyin, Big5);
-	File mapFile(mapping_file, "r");
-	map->read(mapFile);
-	mapFile.close();
 	
 	//init lm
 	lm = new Ngram(voc, order);
 	File lmFile(lm_file, "r");
 	lm->read(lmFile);
 	lmFile.close();
+	//init map
+	FILE *fp = fopen(mapping_file,"r");
+	char line[MAXPERLINE];
+	while(fgets(line, sizeof(line),fp)!=NULL){
+		line[strlen(line)-1]='\0';
+		char *token = strtok(line, " ");
+		string key = token;
+		token = strtok(NULL, " ");
+		while(token!=NULL){
+			mymap[key].push_back(token);
+			token = strtok(NULL, " ");
+		}
+	}
+	mymap["<s>"].push_back("<s>");
+	mymap["</s>"].push_back("</s>");
 }
 
-VocabIndex myGetIndex(const VocabIndex& big5_idx){
-	VocabIndex index = voc.getIndex(Big5.getWord(big5_idx));
+VocabIndex myGetIndex(const char *word){
+	VocabIndex index = voc.getIndex(word);
 	return (index == Vocab_None)? voc.getIndex(Vocab_Unknown) : index;
 }
 LogP getP(LogP p){
@@ -52,13 +72,13 @@ struct compare
 		return a.second < b.second;
 	}
 };
-void disamLine(VocabString* w, FILE* fp, unt w_num){
-	LogP prob[MAXPERLINE][CAND_NUM] = {{0.0}};
-	VocabIndex IndexSet[MAXPERLINE][CAND_NUM];
-	int BackTrack[MAXPERLINE][CAND_NUM];
-	int SetNum[MAXPERLINE][CAND_NUM] = {{0}};
-	int*** TrackSet = new int**[MAXPERLINE];
-	for(int i = 0;i<MAXPERLINE;i++){
+void disamLine(const vector<string>& w, FILE* fp, unt w_num, MAP& mymap){
+	vector<vector<Node> > table;
+	vector<Node> CandSet;
+	int SetNum[MAXBUFNUM][CAND_NUM] = {{0}};
+	int CandNum[MAXBUFNUM] = {};
+	int*** TrackSet = new int**[MAXBUFNUM];
+	for(int i = 0;i<MAXBUFNUM;i++){
 		TrackSet[i] = new int*[CAND_NUM];
 		for(int j=0;j<CAND_NUM;j++){
 			TrackSet[i][j] = new int[MAXPRON];
@@ -68,140 +88,134 @@ void disamLine(VocabString* w, FILE* fp, unt w_num){
 	TwoHistory[2] = Vocab_None;
 	Prob p;
 	VocabIndex index;
-	int CandNum[MAXPERLINE] = {};
-	for(int i = 0; i < w_num; i++){
-		VocabMapIter iter(*map, Zhuyin.getIndex(w[i]));
-		iter.init();
+	int i = -1;
+	for(auto it = w.begin(); it != w.end(); it++){
+		i -=-1;
+		CandSet.clear();
 		if(i == 0){//unigram
-			while(iter.next(index, p)){
-				VocabIndex cand = myGetIndex(index);
-				LogP uni_p = getP(lm->wordProb(cand, NoHistory));
-				prob[0][CandNum[0]] = uni_p;
-				IndexSet[0][CandNum[0]] = index;
-				BackTrack[0][CandNum[0]] = -1;
+			for(auto j = mymap[*it].begin(); j!=mymap[*it].end();j++){
+				VocabIndex cand = myGetIndex(j->data());
+				LogP uni_p = getP(lm->wordProb(cand,NoHistory));
+				CandSet.push_back((Node){0,uni_p,"<s>"});
 				int num = SetNum[0][CandNum[0]];
 				TrackSet[0][CandNum[0]][num] = -1;
 				CandNum[0]++;
+				table.push_back(CandSet);
 			}
 		}
 		else if(i == 1){//bigram
 			priority_queue<pip, vector<pip>, compare > pq;
-			while(iter.next(index,p)){
-				VocabIndex cand = myGetIndex(index);
+			for(auto j = mymap[*it].begin(); j!=mymap[*it].end();j++){
+				VocabIndex cand = myGetIndex(j->data());
 				LogP uni_p = lm->wordProb(cand, NoHistory);
 				LogP maxP = LogP_Zero;
 				int maxCand = 0;
-				for(int j = 0;j < CandNum[i-1];j++){
-					OneHistory[0] = myGetIndex(IndexSet[i-1][j]);
+				for(int k = 0;k<table[i-1].size();k++){
+					OneHistory[0]=myGetIndex(table[i-1][k].word.data());
 					LogP bi_p = lm->wordProb(cand, OneHistory);
 					if(uni_p == LogP_Zero && bi_p == LogP_Zero)
 						bi_p = LOG_ZERO;
-					LogP pcand = bi_p + prob[i-1][j];
+					LogP pcand = bi_p + table[i-1][k].p;
 					if(pcand > maxP){
-					maxP = pcand;
-					maxCand = j;
+						maxP = pcand;
+						maxCand = k;
 					}
-					pq.push(make_pair(j,pcand));
+					pq.push(make_pair(k,pcand));
 					if(pq.size() > pron)
 						pq.pop();
 				}
 				
-				for(int j = 0;j < pq.size();j++){
+				for(int k = 0;k < pq.size();k++){
 				pip temp = pq.top();
 				pq.pop();
-				TrackSet[i][CandNum[i]][j] = temp.first;
+				TrackSet[i][CandNum[i]][k] = temp.first;
 				SetNum[i][CandNum[i]]++;
 				}
 				
-				prob[i][CandNum[i]] = maxP;
-				IndexSet[i][CandNum[i]] = index;
-				BackTrack[i][CandNum[i]] = maxCand;
+				CandSet.push_back((Node){maxCand,maxP,*j});
 				CandNum[i]++;	
 			}
+			table.push_back(CandSet);
 		}
 		else{//trigram
 			priority_queue<pip, vector<pip>, compare > pq;
-			while(iter.next(index,p)){
-				VocabIndex cand = myGetIndex(index);
+			for(auto j = mymap[*it].begin(); j!=mymap[*it].end();j++){
+				VocabIndex cand = myGetIndex(j->data());
 				LogP uni_p = lm->wordProb(cand, NoHistory);
 				LogP maxP = LogP_Zero;
 				int maxCand = 0;
-				int q = 0;
-				for(int j = 0;j < CandNum[i-1];j++){//bigram
-					for(int k = 0;k < SetNum[i-1][j];k++){
+				for(int k = 0;k<table[i-1].size();k++){//bigram
+					for(int r = 0;r < SetNum[i-1][k];r++){
 					//for start
-					int last = TrackSet[i-1][j][k];
-					int t = TrackSet[1][0][0];
-					TwoHistory[1] = myGetIndex(IndexSet[i-2][last]);
-					TwoHistory[0] = myGetIndex(IndexSet[i-1][j]);
+					int last = TrackSet[i-1][k][r];
+					TwoHistory[1] = myGetIndex(table[i-2][last].word.data());
+					TwoHistory[0] = myGetIndex(table[i-1][k].word.data());
 					OneHistory[0] = TwoHistory[1];
 					LogP tri_p = lm->wordProb(cand, TwoHistory);
 					LogP bi_p = lm->wordProb(TwoHistory[0], OneHistory);
 					if(uni_p == LogP_Zero && bi_p == LogP_Zero && tri_p == LogP_Zero)
 						tri_p = LOG_ZERO;
-					LogP pcand = tri_p + bi_p + prob[i-2][last];
+					LogP pcand = tri_p + bi_p + table[i-2][last].p;
 					if(pcand > maxP){
 						maxP = pcand;
-						maxCand = j;
+						maxCand = k;
 					}
 					
-					pq.push(make_pair(j,pcand));
+					pq.push(make_pair(k,pcand));
 					if(pq.size() > pron)
 						pq.pop();
 					
 					}//for end								
 				}
-				for(int j = 0; j < pq.size();j++){
+				for(int k = 0; k < pq.size();k++){
 				pip temp = pq.top();
 				pq.pop();
-				TrackSet[i][CandNum[i]][j] = temp.first;
+				TrackSet[i][CandNum[i]][k] = temp.first;
 				SetNum[i][CandNum[i]]++;
 				}
-				prob[i][CandNum[i]] = maxP;
-				IndexSet[i][CandNum[i]] = index;
-				BackTrack[i][CandNum[i]] = maxCand;
+				CandSet.push_back((Node){maxCand,maxP,*j});
 				CandNum[i]++;	
 			}
+			table.push_back(CandSet);
 		}
 	}
 	
 	//backtracking
-	LogP maxP = LogP_Zero;
-	int maxCand;
-	for(int i = 0;i < CandNum[w_num-1];i++){
-		if(prob[w_num-1][i] > maxP){
-			maxP = prob[w_num-1][i];
-			maxCand = i;
-		}	
+	vector<string> outstring;
+	int idx = 0;
+	for(int i=table.size()-1;i>=0;i--){
+		outstring.push_back(table[i][idx].word);
+		idx = table[i][idx].index;
 	}
-	VocabString OutPutString[1024];
-	for(int i = w_num-1; i > 0; i--){
-		OutPutString[i] = Big5.getWord(IndexSet[i][maxCand]);
-		maxCand = BackTrack[i][maxCand];
+	for(int i = outstring.size()-1;i>=0;i--){
+		fprintf(fp,"%s%s",outstring[i].data(),(i == 0)? "\n" : " ");
 	}
-	OutPutString[0] = "<s>";
-	OutPutString[w_num-1] = "</s>";
-	for(int i = 0; i < w_num; i++)
-		fprintf(fp, "%s%s", OutPutString[i], (i == w_num-1)? "\n" : " ");
 	
 }
-
-void solve(const char* input_text, const char* outFile){
-	File inputFile(input_text, "r");
+vector<string> sep_string(char line[]){
+	vector<string> out_s;
+	out_s.push_back("<s>");
+	char *token = strtok(line, " ");
+	while(token != NULL){	
+		out_s.push_back(token);
+		token = strtok(NULL, " ");
+	}
+	out_s.push_back("</s>");
+	return out_s;
+}
+void solve(const char* input_text, const char* outFile, MAP& mymap){
+	
 	FILE* outputFile = fopen(outFile, "wb+");
-	char* line;
-	while(line = inputFile.getline()){
-	VocabString w[maxWordsPerLine];
-	unt w_num = Vocab::parseWords(line, &w[1], maxWordsPerLine) + 2;
-	w[0] = "<s>";
-	w[w_num-1] = "</s>";
-	disamLine(w, outputFile, w_num);
-	
+	char line[512];
+	FILE* inputFile = fopen(input_text,"r");
+	while(fgets(line, sizeof(line),inputFile)!=NULL){
+		line[strlen(line)-1]='\0';
+		vector<string> in_string = sep_string(line);	
+		disamLine(in_string, outputFile, in_string.size(), mymap);
 	}
-	inputFile.close();
 	fclose(outputFile);
+	fclose(inputFile);
 }
-
 int main(int argc, char* argv[]){
 
 	const char* input_text = argv[1];
@@ -209,6 +223,7 @@ int main(int argc, char* argv[]){
 	const char* lm_file = argv[3];
 	const char* outFile = argv[4];
 	pron = atoi(argv[5]);
-	init_disambig(mapping_file, lm_file, 3);
-	solve(input_text, outFile);
+	MAP mymap;
+	init_disambig(mapping_file, lm_file, 3, mymap);
+	solve(input_text, outFile, mymap);
 }
